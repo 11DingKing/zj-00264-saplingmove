@@ -13,7 +13,7 @@ VALID_TRANSITIONS = {
     models.AllocationStatus.APPLIED: [models.AllocationStatus.REVIEWED, models.AllocationStatus.APPLIED],
     models.AllocationStatus.REVIEWED: [models.AllocationStatus.LOCKED, models.AllocationStatus.APPLIED],
     models.AllocationStatus.LOCKED: [models.AllocationStatus.SHIPPING, models.AllocationStatus.APPLIED],
-    models.AllocationStatus.SHIPPING: [models.AllocationStatus.RECEIVED],
+    models.AllocationStatus.SHIPPING: [models.AllocationStatus.RECEIVED, models.AllocationStatus.APPLIED],
     models.AllocationStatus.RECEIVED: [],
 }
 
@@ -179,20 +179,25 @@ def revoke_allocation(
     alloc = db.query(models.AllocationRequest).filter(models.AllocationRequest.id == allocation_id).first()
     if not alloc:
         raise HTTPException(status_code=404, detail="调拨申请不存在")
-    if alloc.status not in [models.AllocationStatus.LOCKED]:
-        raise HTTPException(status_code=400, detail=f"当前状态[{alloc.status.value}]不能撤销(仅锁定状态可撤销)")
+    if alloc.status not in [models.AllocationStatus.LOCKED, models.AllocationStatus.SHIPPING]:
+        raise HTTPException(status_code=400, detail=f"当前状态[{alloc.status.value}]不能撤销(仅锁定或起运状态可撤销)")
 
     for item in alloc.items:
-        if item.allocated_quantity and item.allocated_quantity > 0:
+        if alloc.status == models.AllocationStatus.LOCKED:
+            release_qty = item.allocated_quantity or 0
+        else:
+            release_qty = item.shipped_quantity or 0
+
+        if release_qty > 0:
             stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == item.nursery_stock_id).first()
             if stock:
-                release_qty = item.allocated_quantity
                 if stock.locked_stock >= release_qty:
                     stock.locked_stock -= release_qty
                 else:
                     stock.locked_stock = 0
                 stock.available_stock = stock.total_stock - stock.locked_stock
-            item.allocated_quantity = 0
+        item.allocated_quantity = 0
+        item.shipped_quantity = None
 
     alloc.status = models.AllocationStatus.APPLIED
     alloc.revoker = data.revoker
@@ -224,6 +229,16 @@ def ship_allocation(
         if ship_qty > (item.allocated_quantity or 0):
             raise HTTPException(status_code=400, detail=f"明细{item.id}起运数量超过锁定数量")
         item.shipped_quantity = ship_qty
+
+        not_shipped = (item.allocated_quantity or 0) - ship_qty
+        if not_shipped > 0:
+            stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == item.nursery_stock_id).first()
+            if stock:
+                if stock.locked_stock >= not_shipped:
+                    stock.locked_stock -= not_shipped
+                else:
+                    stock.locked_stock = 0
+                stock.available_stock = stock.total_stock - stock.locked_stock
 
     alloc.status = models.AllocationStatus.SHIPPING
     alloc.shipper = data.shipper
@@ -258,11 +273,13 @@ def receive_allocation(
 
         stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == item.nursery_stock_id).first()
         if stock:
-            deduct_qty = recv_qty
-            if stock.locked_stock >= deduct_qty:
-                stock.locked_stock -= deduct_qty
-            if stock.total_stock >= deduct_qty:
-                stock.total_stock -= deduct_qty
+            still_locked = item.shipped_quantity or 0
+            if stock.locked_stock >= still_locked:
+                stock.locked_stock -= still_locked
+            else:
+                stock.locked_stock = 0
+            if stock.total_stock >= recv_qty:
+                stock.total_stock -= recv_qty
             stock.available_stock = stock.total_stock - stock.locked_stock
 
     alloc.status = models.AllocationStatus.RECEIVED
