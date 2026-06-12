@@ -125,12 +125,45 @@ class PlotRequirementUpdate(BaseModel):
 
 class PlotRequirement(PlotRequirementBase):
     id: int
+    received_quantity: int
     planted_quantity: int
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class PlotRequirementWithGap(PlotRequirement):
+    gap_quantity: int
+    fulfillment_rate: float
+
+
+class GapBySpec(BaseModel):
+    spec_name: str
+    total_required: int
+    total_received: int
+    total_gap: int
+    affected_plots: int
+
+
+class PlotGapSummary(BaseModel):
+    plot_id: int
+    plot_name: str
+    project: str
+    region: str
+    spec_name: str
+    required_quantity: int
+    received_quantity: int
+    gap_quantity: int
+    fulfillment_rate: float
+
+
+class DispatchRecommendation(BaseModel):
+    spec_name: str
+    total_gap: int
+    total_available: int
+    plots_needing: List[PlotGapSummary] = []
 
 
 class AllocationItemBase(BaseModel):

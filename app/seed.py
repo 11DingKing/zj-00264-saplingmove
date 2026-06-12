@@ -172,6 +172,7 @@ def seed_data(db: Session):
                                remark="阳坡台地配置"),
     ]
     for r in reqs:
+        r.received_quantity = 0
         r.planted_quantity = 0
     db.add_all(reqs)
     db.flush()

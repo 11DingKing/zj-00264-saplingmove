@@ -198,6 +198,95 @@ def stats_by_plot_spec(
     return results
 
 
+@router.get("/gap-by-spec", response_model=List[schemas.GapBySpec])
+def stats_gap_by_spec(
+    spec_name: Optional[str] = None,
+    has_gap_only: bool = True,
+    db: Session = Depends(get_db),
+):
+    query = db.query(
+        models.PlotRequirement.spec_name,
+        func.coalesce(func.sum(models.PlotRequirement.required_quantity), 0).label("total_required"),
+        func.coalesce(func.sum(models.PlotRequirement.received_quantity), 0).label("total_received"),
+        func.count(func.distinct(models.PlotRequirement.plot_id)).label("affected_plots"),
+    )
+    if spec_name:
+        query = query.filter(models.PlotRequirement.spec_name.contains(spec_name))
+    query = query.group_by(models.PlotRequirement.spec_name)
+    rows = query.all()
+
+    results = []
+    for row in rows:
+        gap = (row.total_required or 0) - (row.total_received or 0)
+        if has_gap_only and gap <= 0:
+            continue
+        results.append(schemas.GapBySpec(
+            spec_name=row.spec_name,
+            total_required=row.total_required or 0,
+            total_received=row.total_received or 0,
+            total_gap=gap if gap > 0 else 0,
+            affected_plots=row.affected_plots or 0,
+        ))
+    return sorted(results, key=lambda x: -x.total_gap)
+
+
+@router.get("/dispatch", response_model=List[schemas.DispatchRecommendation])
+def stats_dispatch(
+    spec_name: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    gap_specs = db.query(
+        models.PlotRequirement.spec_name,
+        func.coalesce(func.sum(models.PlotRequirement.required_quantity), 0).label("total_required"),
+        func.coalesce(func.sum(models.PlotRequirement.received_quantity), 0).label("total_received"),
+    )
+    if spec_name:
+        gap_specs = gap_specs.filter(models.PlotRequirement.spec_name.contains(spec_name))
+    gap_specs = gap_specs.group_by(models.PlotRequirement.spec_name).all()
+
+    stock_query = db.query(
+        models.NurseryStock.spec_name,
+        func.coalesce(func.sum(models.NurseryStock.available_stock), 0).label("total_available"),
+    ).group_by(models.NurseryStock.spec_name).all()
+    stock_map = {row.spec_name: (row.total_available or 0) for row in stock_query}
+
+    results = []
+    for row in gap_specs:
+        gap = (row.total_required or 0) - (row.total_received or 0)
+        if gap <= 0:
+            continue
+
+        plot_gaps = db.query(models.PlotRequirement).filter(
+            models.PlotRequirement.spec_name == row.spec_name,
+            (models.PlotRequirement.required_quantity - models.PlotRequirement.received_quantity) > 0,
+        ).join(models.RestorationPlot).all()
+
+        plots_needing = []
+        for pg in plot_gaps:
+            pg_gap = pg.required_quantity - pg.received_quantity
+            fulfillment_rate = round(pg.received_quantity / pg.required_quantity * 100, 2) if pg.required_quantity > 0 else 0.0
+            plots_needing.append(schemas.PlotGapSummary(
+                plot_id=pg.plot_id,
+                plot_name=pg.plot.name,
+                project=pg.plot.project,
+                region=pg.plot.region,
+                spec_name=pg.spec_name,
+                required_quantity=pg.required_quantity,
+                received_quantity=pg.received_quantity,
+                gap_quantity=pg_gap if pg_gap > 0 else 0,
+                fulfillment_rate=fulfillment_rate,
+            ))
+        plots_needing.sort(key=lambda x: (-x.gap_quantity, x.fulfillment_rate))
+
+        results.append(schemas.DispatchRecommendation(
+            spec_name=row.spec_name,
+            total_gap=gap if gap > 0 else 0,
+            total_available=stock_map.get(row.spec_name, 0),
+            plots_needing=plots_needing,
+        ))
+    return sorted(results, key=lambda x: -x.total_gap)
+
+
 @router.get("/summary")
 def stats_summary(db: Session = Depends(get_db)):
     total_nurseries = db.query(func.count(models.Nursery.id)).scalar() or 0
@@ -207,7 +296,21 @@ def stats_summary(db: Session = Depends(get_db)):
     total_plots = db.query(func.count(models.RestorationPlot.id)).scalar() or 0
     total_area = db.query(func.coalesce(func.sum(models.RestorationPlot.area_mu), 0)).scalar() or 0
     total_req = db.query(func.coalesce(func.sum(models.PlotRequirement.required_quantity), 0)).scalar() or 0
+    req_received = db.query(func.coalesce(func.sum(models.PlotRequirement.received_quantity), 0)).scalar() or 0
     req_planted = db.query(func.coalesce(func.sum(models.PlotRequirement.planted_quantity), 0)).scalar() or 0
+    total_gap = max(0, (total_req or 0) - (req_received or 0))
+
+    gap_specs = db.query(
+        models.PlotRequirement.spec_name,
+    ).group_by(models.PlotRequirement.spec_name).having(
+        (func.sum(models.PlotRequirement.required_quantity) - func.sum(models.PlotRequirement.received_quantity)) > 0
+    ).count()
+
+    gap_plots = db.query(
+        models.PlotRequirement.plot_id,
+    ).group_by(models.PlotRequirement.plot_id).having(
+        (func.sum(models.PlotRequirement.required_quantity) - func.sum(models.PlotRequirement.received_quantity)) > 0
+    ).count()
 
     alloc_query = db.query(
         func.count(models.AllocationRequest.id).label("count"),
@@ -236,8 +339,12 @@ def stats_summary(db: Session = Depends(get_db)):
             "total": total_plots,
             "total_area_mu": round(total_area or 0, 2),
             "required_seedlings": total_req,
+            "received_from_requirement": req_received,
             "planted_from_requirement": req_planted,
-            "requirement_fulfillment_rate": round(req_planted / total_req * 100, 2) if total_req > 0 else 0.0,
+            "total_gap": total_gap,
+            "gap_specs_count": gap_specs,
+            "gap_plots_count": gap_plots,
+            "requirement_fulfillment_rate": round(req_received / total_req * 100, 2) if total_req > 0 else 0.0,
         },
         "allocations": {
             "total_requests": alloc_row.count or 0,

@@ -282,6 +282,13 @@ def receive_allocation(
                 stock.total_stock -= recv_qty
             stock.available_stock = stock.total_stock - stock.locked_stock
 
+        req = db.query(models.PlotRequirement).filter(
+            models.PlotRequirement.plot_id == alloc.plot_id,
+            models.PlotRequirement.spec_name == item.spec_name,
+        ).first()
+        if req:
+            req.received_quantity = (req.received_quantity or 0) + recv_qty
+
     alloc.status = models.AllocationStatus.RECEIVED
     alloc.receiver = data.receiver
     alloc.received_at = datetime.now()
