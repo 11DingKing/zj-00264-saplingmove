@@ -87,6 +87,8 @@ def create_allocation(data: schemas.AllocationRequestCreate, db: Session = Depen
     db.flush()
 
     for item in data.items:
+        if item.applied_quantity <= 0:
+            raise HTTPException(status_code=400, detail=f"申请数量必须大于0(规格: {item.spec_name})")
         stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == item.nursery_stock_id).first()
         if not stock:
             raise HTTPException(status_code=400, detail=f"库存ID={item.nursery_stock_id}不存在")
@@ -124,6 +126,16 @@ def review_allocation(
                 approved = data.item_approvals[str(item.id)]
             else:
                 approved = item.applied_quantity
+            if approved <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"明细{item.id}批准数量必须大于0"
+                )
+            if approved > item.applied_quantity:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"明细{item.id}批准数量({approved})超过申请数量({item.applied_quantity})"
+                )
             item.approved_quantity = approved
     else:
         alloc.status = models.AllocationStatus.APPLIED
@@ -154,6 +166,17 @@ def lock_allocation(
             allocate_qty = data.item_allocations[str(item.id)]
         else:
             allocate_qty = item.approved_quantity or item.applied_quantity
+
+        if allocate_qty <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"明细{item.id}锁定数量必须大于0"
+            )
+        if item.approved_quantity is not None and allocate_qty > item.approved_quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"明细{item.id}锁定数量({allocate_qty})超过批准数量({item.approved_quantity})"
+            )
 
         stock = _check_stock_availability(db, item.nursery_stock_id, allocate_qty)
 
@@ -226,8 +249,10 @@ def ship_allocation(
             ship_qty = data.item_shipments[str(item.id)]
         else:
             ship_qty = item.allocated_quantity or item.approved_quantity or item.applied_quantity
+        if ship_qty <= 0:
+            raise HTTPException(status_code=400, detail=f"明细{item.id}起运数量必须大于0")
         if ship_qty > (item.allocated_quantity or 0):
-            raise HTTPException(status_code=400, detail=f"明细{item.id}起运数量超过锁定数量")
+            raise HTTPException(status_code=400, detail=f"明细{item.id}起运数量({ship_qty})超过锁定数量({item.allocated_quantity})")
         item.shipped_quantity = ship_qty
 
         not_shipped = (item.allocated_quantity or 0) - ship_qty
@@ -267,19 +292,21 @@ def receive_allocation(
             recv_qty = data.item_receives[str(item.id)]
         else:
             recv_qty = item.shipped_quantity or item.allocated_quantity
+        if recv_qty <= 0:
+            raise HTTPException(status_code=400, detail=f"明细{item.id}签收数量必须大于0")
         if recv_qty > (item.shipped_quantity or 0):
-            raise HTTPException(status_code=400, detail=f"明细{item.id}签收数量超过起运数量")
+            raise HTTPException(status_code=400, detail=f"明细{item.id}签收数量({recv_qty})超过起运数量({item.shipped_quantity})")
         item.received_quantity = recv_qty
 
         stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == item.nursery_stock_id).first()
         if stock:
-            still_locked = item.shipped_quantity or 0
-            if stock.locked_stock >= still_locked:
-                stock.locked_stock -= still_locked
+            shipped_qty = item.shipped_quantity or 0
+            if stock.locked_stock >= shipped_qty:
+                stock.locked_stock -= shipped_qty
             else:
                 stock.locked_stock = 0
-            if stock.total_stock >= recv_qty:
-                stock.total_stock -= recv_qty
+            if stock.total_stock >= shipped_qty:
+                stock.total_stock -= shipped_qty
             stock.available_stock = stock.total_stock - stock.locked_stock
 
         req = db.query(models.PlotRequirement).filter(
