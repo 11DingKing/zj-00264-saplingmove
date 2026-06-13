@@ -6,6 +6,7 @@ from datetime import datetime
 
 from app.database import get_db
 from app import models, schemas
+from app.services.stock_service import StockService
 
 router = APIRouter(prefix="/api/allocations", tags=["调拨管理"])
 
@@ -34,16 +35,7 @@ def _generate_request_no(db: Session) -> str:
     return f"{prefix}{seq:04d}"
 
 
-def _check_stock_availability(db: Session, stock_id: int, quantity: int) -> models.NurseryStock:
-    stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == stock_id).first()
-    if not stock:
-        raise HTTPException(status_code=400, detail=f"库存记录不存在(stock_id={stock_id})")
-    if stock.available_stock < quantity:
-        raise HTTPException(
-            status_code=400,
-            detail=f"规格[{stock.spec_name}]可用库存不足: 需{quantity}株, 仅剩{stock.available_stock}株"
-        )
-    return stock
+
 
 
 @router.get("", response_model=List[schemas.AllocationRequest])
@@ -161,6 +153,7 @@ def lock_allocation(
     if alloc.status != models.AllocationStatus.REVIEWED:
         raise HTTPException(status_code=400, detail=f"当前状态[{alloc.status.value}]不能锁定库存")
 
+    stock_service = StockService(db)
     for item in alloc.items:
         if data.item_allocations and str(item.id) in data.item_allocations:
             allocate_qty = data.item_allocations[str(item.id)]
@@ -178,10 +171,7 @@ def lock_allocation(
                 detail=f"明细{item.id}锁定数量({allocate_qty})超过批准数量({item.approved_quantity})"
             )
 
-        stock = _check_stock_availability(db, item.nursery_stock_id, allocate_qty)
-
-        stock.locked_stock += allocate_qty
-        stock.available_stock = stock.total_stock - stock.locked_stock
+        stock_service.lock_stock(item.nursery_stock_id, allocate_qty)
         item.allocated_quantity = allocate_qty
 
     alloc.status = models.AllocationStatus.LOCKED
@@ -205,20 +195,14 @@ def revoke_allocation(
     if alloc.status not in [models.AllocationStatus.LOCKED, models.AllocationStatus.SHIPPING]:
         raise HTTPException(status_code=400, detail=f"当前状态[{alloc.status.value}]不能撤销(仅锁定或起运状态可撤销)")
 
+    stock_service = StockService(db)
     for item in alloc.items:
         if alloc.status == models.AllocationStatus.LOCKED:
             release_qty = item.allocated_quantity or 0
         else:
             release_qty = item.shipped_quantity or 0
 
-        if release_qty > 0:
-            stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == item.nursery_stock_id).first()
-            if stock:
-                if stock.locked_stock >= release_qty:
-                    stock.locked_stock -= release_qty
-                else:
-                    stock.locked_stock = 0
-                stock.available_stock = stock.total_stock - stock.locked_stock
+        stock_service.unlock_stock(item.nursery_stock_id, release_qty)
         item.allocated_quantity = 0
         item.shipped_quantity = None
 
@@ -244,6 +228,7 @@ def ship_allocation(
     if alloc.status != models.AllocationStatus.LOCKED:
         raise HTTPException(status_code=400, detail=f"当前状态[{alloc.status.value}]不能起运")
 
+    stock_service = StockService(db)
     for item in alloc.items:
         if data.item_shipments and str(item.id) in data.item_shipments:
             ship_qty = data.item_shipments[str(item.id)]
@@ -256,14 +241,7 @@ def ship_allocation(
         item.shipped_quantity = ship_qty
 
         not_shipped = (item.allocated_quantity or 0) - ship_qty
-        if not_shipped > 0:
-            stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == item.nursery_stock_id).first()
-            if stock:
-                if stock.locked_stock >= not_shipped:
-                    stock.locked_stock -= not_shipped
-                else:
-                    stock.locked_stock = 0
-                stock.available_stock = stock.total_stock - stock.locked_stock
+        stock_service.unlock_stock(item.nursery_stock_id, not_shipped)
 
     alloc.status = models.AllocationStatus.SHIPPING
     alloc.shipper = data.shipper
@@ -287,6 +265,7 @@ def receive_allocation(
     if alloc.status != models.AllocationStatus.SHIPPING:
         raise HTTPException(status_code=400, detail=f"当前状态[{alloc.status.value}]不能签收")
 
+    stock_service = StockService(db)
     for item in alloc.items:
         if data.item_receives and str(item.id) in data.item_receives:
             recv_qty = data.item_receives[str(item.id)]
@@ -298,16 +277,8 @@ def receive_allocation(
             raise HTTPException(status_code=400, detail=f"明细{item.id}签收数量({recv_qty})超过起运数量({item.shipped_quantity})")
         item.received_quantity = recv_qty
 
-        stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == item.nursery_stock_id).first()
-        if stock:
-            shipped_qty = item.shipped_quantity or 0
-            if stock.locked_stock >= shipped_qty:
-                stock.locked_stock -= shipped_qty
-            else:
-                stock.locked_stock = 0
-            if stock.total_stock >= shipped_qty:
-                stock.total_stock -= shipped_qty
-            stock.available_stock = stock.total_stock - stock.locked_stock
+        shipped_qty = item.shipped_quantity or 0
+        stock_service.consume_stock(item.nursery_stock_id, shipped_qty)
 
         req = db.query(models.PlotRequirement).filter(
             models.PlotRequirement.plot_id == alloc.plot_id,

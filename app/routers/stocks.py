@@ -4,6 +4,7 @@ from typing import List
 
 from app.database import get_db
 from app import models, schemas
+from app.services.stock_service import StockService
 
 router = APIRouter(prefix="/api/stocks", tags=["苗木库存"])
 
@@ -31,12 +32,13 @@ def update_stock(stock_id: int, data: schemas.NurseryStockUpdate, db: Session = 
     stock = db.query(models.NurseryStock).filter(models.NurseryStock.id == stock_id).first()
     if not stock:
         raise HTTPException(status_code=404, detail="库存不存在")
-    for key, value in data.model_dump(exclude_unset=True).items():
-        setattr(stock, key, value)
-    if "total_stock" in data.model_dump(exclude_unset=True):
-        if stock.total_stock < stock.locked_stock:
-            raise HTTPException(status_code=400, detail="总库存不能小于已锁定库存")
-        stock.available_stock = stock.total_stock - stock.locked_stock
+    update_data = data.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        if key != "total_stock":
+            setattr(stock, key, value)
+    if "total_stock" in update_data:
+        stock_service = StockService(db)
+        stock_service.adjust_total_stock(stock_id, update_data["total_stock"])
     db.commit()
     db.refresh(stock)
     return stock
